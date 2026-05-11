@@ -139,6 +139,9 @@ export const syncJobs = pgTable("sync_jobs", {
   finishedAt: timestamp("finished_at"),
   rowsProcessed: integer("rows_processed").default(0),
   errorMsg: text("error_msg"),
+  // resumable batch tracking
+  csvUrl: text("csv_url"),
+  currentOffset: integer("current_offset").default(0),
   createdAt: timestamp("created_at").defaultNow(),
 })
 

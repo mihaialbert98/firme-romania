@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { syncJobs } from "@/lib/db/schema"
-import { runOnrcImport } from "@/lib/ingestion/onrc"
+import { startOnrcImport } from "@/lib/ingestion/onrc"
 import { runAnafEnrichment } from "@/lib/ingestion/anaf-api"
 import { runFinancialsImport } from "@/lib/ingestion/financials"
 
@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
 
   // Fire and forget — don't await so the response returns immediately
   const runners: Record<string, (id: number) => Promise<void>> = {
-    onrc_bulk: runOnrcImport,
+    onrc_bulk: startOnrcImport,
     anaf_daily: runAnafEnrichment,
     financials_annual: runFinancialsImport,
   }
