@@ -1,13 +1,12 @@
 import { parse } from "csv-parse"
 import { Readable } from "stream"
 import { db } from "@/lib/db"
-import { companies, syncJobs } from "@/lib/db/schema"
-import { sql, eq } from "drizzle-orm"
+import { companies, syncJobs, syncChunks } from "@/lib/db/schema"
+import { sql, eq, and } from "drizzle-orm"
 
 const CKAN_PACKAGE_ID = "firme-inregistrate-la-registrul-comertului"
 const CKAN_API = "https://data.gov.ro/api/3/action/package_show"
-const BATCH_SIZE = 1000 // rows per invocation
-const MAX_MS = 7000     // stop before Vercel's 10s limit
+const CHUNK_SIZE = 2000 // rows per chunk stored in DB
 
 async function getLatestCsvUrl(): Promise<string> {
   const res = await fetch(`${CKAN_API}?id=${CKAN_PACKAGE_ID}`)
@@ -32,43 +31,76 @@ async function parseCsv(text: string): Promise<Record<string, string>[]> {
   })
 }
 
-// Called once to kick off — downloads CSV, stores URL, starts first batch
+// Step 1: download CSV once, split into chunks stored in DB, then kick off processing
 export async function startOnrcImport(jobId: number): Promise<void> {
+  await db.update(syncJobs).set({ status: "running", startedAt: new Date() }).where(eq(syncJobs.id, jobId))
+
   try {
     const csvUrl = await getLatestCsvUrl()
-    await db.update(syncJobs).set({ status: "running", startedAt: new Date(), csvUrl, currentOffset: 0 }).where(eq(syncJobs.id, jobId))
-    await processOnrcBatch(jobId)
+    await db.update(syncJobs).set({ csvUrl }).where(eq(syncJobs.id, jobId))
+
+    const res = await fetch(csvUrl)
+    if (!res.ok) throw new Error(`Failed to fetch CSV: ${res.status}`)
+    const text = await res.text()
+
+    const records = await parseCsv(text)
+    const totalChunks = Math.ceil(records.length / CHUNK_SIZE)
+
+    // Store all chunks in DB
+    for (let i = 0; i < totalChunks; i++) {
+      const slice = records.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
+      await db.insert(syncChunks).values({
+        jobId,
+        chunkIndex: i,
+        data: JSON.stringify(slice),
+        processed: false,
+      })
+    }
+
+    await db.update(syncJobs).set({ currentOffset: 0, rowsProcessed: 0 }).where(eq(syncJobs.id, jobId))
+
+    // Kick off first chunk
+    await processNextChunk(jobId)
   } catch (err) {
     await db.update(syncJobs).set({ status: "failed", finishedAt: new Date(), errorMsg: String(err) }).where(eq(syncJobs.id, jobId))
   }
 }
 
-// Processes one batch starting at stored offset, then re-triggers itself
+// Step 2: process one chunk, mark it done, trigger next
 export async function processOnrcBatch(jobId: number): Promise<void> {
-  const [job] = await db.select().from(syncJobs).where(eq(syncJobs.id, jobId)).limit(1)
-  if (!job || !job.csvUrl) return
+  await processNextChunk(jobId)
+}
 
-  const offset = job.currentOffset ?? 0
-  const started = Date.now()
+async function processNextChunk(jobId: number): Promise<void> {
+  const [job] = await db.select().from(syncJobs).where(eq(syncJobs.id, jobId)).limit(1)
+  if (!job || job.status === "failed") return
+
+  // Find next unprocessed chunk
+  const [chunk] = await db
+    .select()
+    .from(syncChunks)
+    .where(and(eq(syncChunks.jobId, jobId), eq(syncChunks.processed, false)))
+    .orderBy(syncChunks.chunkIndex)
+    .limit(1)
+
+  if (!chunk) {
+    // All chunks done — update search vectors and mark complete
+    await db.execute(
+      sql`UPDATE companies
+          SET search_vector = to_tsvector('simple',
+            coalesce(name,'') || ' ' || coalesce(cui,'') || ' ' || coalesce(city,''))
+          WHERE search_vector IS NULL`
+    )
+    // Clean up chunks
+    await db.delete(syncChunks).where(eq(syncChunks.jobId, jobId))
+    await db.update(syncJobs).set({ status: "done", finishedAt: new Date() }).where(eq(syncJobs.id, jobId))
+    return
+  }
 
   try {
-    const res = await fetch(job.csvUrl)
-    if (!res.ok) throw new Error(`Failed to fetch CSV: ${res.status}`)
-    const text = await res.text()
-    const records = await parseCsv(text)
+    const records: Record<string, string>[] = JSON.parse(chunk.data)
 
-    const batch = records.slice(offset, offset + BATCH_SIZE)
-    if (!batch.length) {
-      // All done — update search vectors and mark complete
-      await db.execute(
-        sql`UPDATE companies SET search_vector = to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(cui,'') || ' ' || coalesce(city,''))
-            WHERE search_vector IS NULL`
-      )
-      await db.update(syncJobs).set({ status: "done", finishedAt: new Date() }).where(eq(syncJobs.id, jobId))
-      return
-    }
-
-    const values = batch.map((r) => ({
+    const values = records.map((r) => ({
       cui: (r.CUI || r.cui || "").replace(/^RO/, "").trim(),
       jNumber: r.NR_REG_COM || r.j_number || null,
       name: r.DENUMIRE || r.name || "",
@@ -105,19 +137,21 @@ export async function processOnrcBatch(jobId: number): Promise<void> {
       })
     }
 
-    const newOffset = offset + BATCH_SIZE
-    const newTotal = (job.rowsProcessed ?? 0) + values.length
-    await db.update(syncJobs).set({ currentOffset: newOffset, rowsProcessed: newTotal }).where(eq(syncJobs.id, jobId))
+    // Mark chunk as processed
+    await db.update(syncChunks).set({ processed: true }).where(eq(syncChunks.id, chunk.id))
+    await db.update(syncJobs)
+      .set({ rowsProcessed: (job.rowsProcessed ?? 0) + values.length })
+      .where(eq(syncJobs.id, jobId))
 
-    // Re-trigger next batch via internal API (bypasses serverless timeout)
-    const appUrl = process.env.NEXTAUTH_URL ?? process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : "http://localhost:3000"
-    fetch(`${appUrl}/api/admin/onrc-batch`, {
+    // Trigger next chunk via internal API
+    const baseUrl = process.env.NEXTAUTH_URL
+      ?? (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000")
+
+    fetch(`${baseUrl}/api/admin/onrc-batch`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-cron-secret": process.env.CRON_SECRET ?? "" },
       body: JSON.stringify({ jobId }),
-    }).catch(() => {})
+    }).catch(console.error)
 
   } catch (err) {
     await db.update(syncJobs).set({ status: "failed", finishedAt: new Date(), errorMsg: String(err) }).where(eq(syncJobs.id, jobId))

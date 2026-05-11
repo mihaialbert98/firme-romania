@@ -131,6 +131,15 @@ export const verificationTokens = pgTable("verification_tokens", {
   expires: timestamp("expires").notNull(),
 })
 
+// Temporary storage for large CSV imports — rows stored as JSON chunks
+export const syncChunks = pgTable("sync_chunks", {
+  id: serial("id").primaryKey(),
+  jobId: integer("job_id").notNull(),
+  chunkIndex: integer("chunk_index").notNull(),
+  data: text("data").notNull(), // JSON array of rows
+  processed: boolean("processed").default(false),
+})
+
 export const syncJobs = pgTable("sync_jobs", {
   id: serial("id").primaryKey(),
   type: text("type").notNull(), // onrc_bulk | anaf_daily | financials_annual
