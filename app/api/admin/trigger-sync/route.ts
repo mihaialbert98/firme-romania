@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server"
-
-export const maxDuration = 300
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { syncJobs } from "@/lib/db/schema"
 import { startOnrcImport } from "@/lib/ingestion/onrc"
 import { runAnafEnrichment } from "@/lib/ingestion/anaf-api"
 import { runFinancialsImport } from "@/lib/ingestion/financials"
+
+export const maxDuration = 300
 
 export async function POST(req: NextRequest) {
   const session = await auth()
@@ -28,8 +28,12 @@ export async function POST(req: NextRequest) {
     financials_annual: runFinancialsImport,
   }
 
-  // Fire and forget — response returns immediately, job runs async
-  runners[type](job.id).catch(console.error)
-
-  return NextResponse.json({ jobId: job.id })
+  // Await the job — maxDuration = 300s gives us enough time
+  // The HTTP response only returns once the job finishes or fails
+  try {
+    await runners[type](job.id)
+    return NextResponse.json({ jobId: job.id, status: "done" })
+  } catch (err) {
+    return NextResponse.json({ jobId: job.id, status: "failed", error: String(err) }, { status: 500 })
+  }
 }
