@@ -1,22 +1,20 @@
 import { parse } from "csv-parse"
-import { Readable } from "stream"
 import { db } from "@/lib/db"
 import { companies, syncJobs } from "@/lib/db/schema"
 import { sql, eq } from "drizzle-orm"
 
 const CKAN_SEARCH = "https://data.gov.ro/api/3/action/package_search"
-const INSERT_CHUNK = 500
+const INSERT_CHUNK = 200
 
 interface DatasetUrls {
   firme: string
   stare: string
 }
 
-// Find the latest monthly ONRC dataset and return the two CSV URLs we need
 async function getLatestUrls(): Promise<DatasetUrls> {
   const res = await fetch(
     `${CKAN_SEARCH}?q=firme+registrul+comertului&rows=1&sort=metadata_modified+desc`,
-    { signal: AbortSignal.timeout(10000) }
+    { signal: AbortSignal.timeout(30000) }
   )
   if (!res.ok) throw new Error(`CKAN search failed: ${res.status}`)
   const json = await res.json()
@@ -25,7 +23,7 @@ async function getLatestUrls(): Promise<DatasetUrls> {
 
   const latestId: string = results[0].name
   const detail = await fetch(`https://data.gov.ro/api/3/action/package_show?id=${latestId}`, {
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(30000),
   })
   const detailJson = await detail.json()
   const resources: { url: string }[] = detailJson.result?.resources ?? []
@@ -38,22 +36,20 @@ async function getLatestUrls(): Promise<DatasetUrls> {
   return { firme, stare }
 }
 
-async function fetchCsv(url: string): Promise<Record<string, string>[]> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(120000) })
-  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`)
+// Fetch smaller stare file fully into memory for lookup
+async function loadStareMap(): Promise<Map<string, string>> {
+  const urls = await getLatestUrls()
+  const res = await fetch(urls.stare)
+  if (!res.ok) throw new Error(`Failed to fetch stare: ${res.status}`)
   const text = await res.text()
 
-  return new Promise((resolve, reject) => {
-    const rows: Record<string, string>[] = []
-    const parser = parse({ columns: true, skip_empty_lines: true, trim: true, bom: true, delimiter: "^" })
-    parser.on("readable", () => {
-      let r: Record<string, string>
-      while ((r = parser.read()) !== null) rows.push(r)
-    })
-    parser.on("error", reject)
-    parser.on("end", () => resolve(rows))
-    Readable.from(text).pipe(parser)
-  })
+  const map = new Map<string, string>()
+  const lines = text.split("\n").slice(1) // skip header
+  for (const line of lines) {
+    const [cod, status] = line.split("^")
+    if (cod?.trim()) map.set(cod.trim(), (status ?? "").trim())
+  }
+  return map
 }
 
 export async function startOnrcImport(jobId: number): Promise<void> {
@@ -63,82 +59,84 @@ export async function startOnrcImport(jobId: number): Promise<void> {
   try {
     const urls = await getLatestUrls()
 
-    // Load status lookup: COD_INMATRICULARE -> status code
-    const stareRows = await fetchCsv(urls.stare)
+    // Load status lookup (small file ~30MB)
+    const stareRes = await fetch(urls.stare)
+    if (!stareRes.ok) throw new Error(`Failed to fetch stare: ${stareRes.status}`)
+    const stareText = await stareRes.text()
     const stareMap = new Map<string, string>()
-    for (const r of stareRows) {
-      if (r.COD_INMATRICULARE) stareMap.set(r.COD_INMATRICULARE.trim(), r.COD ?? "")
+    for (const line of stareText.split("\n").slice(1)) {
+      const [cod, status] = line.split("^")
+      if (cod?.trim()) stareMap.set(cod.trim(), (status ?? "").trim())
     }
 
-    // Load main companies file
-    const firmeRows = await fetchCsv(urls.firme)
+    // Stream the large firme CSV and process row by row
+    const firmeRes = await fetch(urls.firme)
+    if (!firmeRes.ok) throw new Error(`Failed to fetch firme: ${firmeRes.status}`)
+    if (!firmeRes.body) throw new Error("No response body")
 
-    // Upsert in chunks of 500
-    for (let i = 0; i < firmeRows.length; i += INSERT_CHUNK) {
-      const chunk = firmeRows.slice(i, i + INSERT_CHUNK)
-      const values = chunk
-        .map((r) => {
-          const cui = (r.CUI ?? "").replace(/^RO/, "").trim()
-          const jNumber = (r.COD_INMATRICULARE ?? "").trim() || null
-          const statusCode = jNumber ? stareMap.get(jNumber) : undefined
-          const address = [
-            r.ADR_DEN_STRADA,
-            r.ADR_NR_STRADA,
-            r.ADR_BLOC ? `Bl. ${r.ADR_BLOC}` : "",
-            r.ADR_SCARA ? `Sc. ${r.ADR_SCARA}` : "",
-            r.ADR_APARTAMENT ? `Ap. ${r.ADR_APARTAMENT}` : "",
-            r.ADR_SECTOR ? `Sector ${r.ADR_SECTOR}` : "",
-          ].filter(Boolean).join(", ") || null
+    type MappedRow = NonNullable<ReturnType<typeof mapRow>>
+  let buffer: MappedRow[] = []
 
-          return {
-            cui: cui || `_${jNumber}`,  // fallback key for CUI=0 entries
-            jNumber,
-            name: (r.DENUMIRE ?? "").trim(),
-            status: mapStatusCode(statusCode),
-            legalForm: (r.FORMA_JURIDICA ?? "").trim() || null,
-            county: (r.ADR_JUDET ?? "").trim() || null,
-            city: (r.ADR_LOCALITATE ?? "").trim() || null,
-            address,
-            caenCode: null,
-            caenDescription: null,
-            registrationDate: parseDate(r.DATA_INMATRICULARE),
-            companyScore: 0,
-            lastOnrcSyncAt: new Date(),
-            updatedAt: new Date(),
+    await new Promise<void>((resolve, reject) => {
+      const parser = parse({
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        bom: true,
+        delimiter: "^",
+      })
+
+      parser.on("readable", async () => {
+        let record: Record<string, string>
+        while ((record = parser.read()) !== null) {
+          const row = mapRow(record, stareMap)
+          if (row) buffer.push(row as MappedRow)
+
+          if (buffer.length >= INSERT_CHUNK) {
+            parser.pause()
+            const chunk = buffer.splice(0, INSERT_CHUNK)
+            try {
+              await insertChunk(chunk)
+              rowsProcessed += chunk.length
+              if (rowsProcessed % 5000 < INSERT_CHUNK) {
+                await db.update(syncJobs).set({ rowsProcessed }).where(eq(syncJobs.id, jobId))
+              }
+            } catch (e) {
+              reject(e)
+              return
+            }
+            parser.resume()
           }
-        })
-        .filter((v) => v.name)
+        }
+      })
 
-      if (!values.length) continue
+      parser.on("end", async () => {
+        // Flush remaining rows
+        if (buffer.length) {
+          try {
+            await insertChunk(buffer)
+            rowsProcessed += buffer.length
+            buffer = []
+          } catch (e) { reject(e); return }
+        }
+        resolve()
+      })
 
-      await db
-        .insert(companies)
-        .values(values)
-        .onConflictDoUpdate({
-          target: companies.cui,
-          set: {
-            name: sql`EXCLUDED.name`,
-            status: sql`EXCLUDED.status`,
-            legalForm: sql`EXCLUDED.legal_form`,
-            county: sql`EXCLUDED.county`,
-            city: sql`EXCLUDED.city`,
-            address: sql`EXCLUDED.address`,
-            caenCode: sql`EXCLUDED.caen_code`,
-            caenDescription: sql`EXCLUDED.caen_description`,
-            registrationDate: sql`EXCLUDED.registration_date`,
-            jNumber: sql`EXCLUDED.j_number`,
-            lastOnrcSyncAt: sql`EXCLUDED.last_onrc_sync_at`,
-            updatedAt: sql`EXCLUDED.updated_at`,
-          },
-        })
+      parser.on("error", reject)
 
-      rowsProcessed += values.length
-
-      // Update progress every 10k rows
-      if (rowsProcessed % 10000 < INSERT_CHUNK) {
-        await db.update(syncJobs).set({ rowsProcessed }).where(eq(syncJobs.id, jobId))
+      // Pipe Node.js readable stream from fetch body
+      const reader = firmeRes.body!.getReader()
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) { parser.end(); break }
+            parser.write(Buffer.from(value))
+          }
+        } catch (e) { reject(e) }
       }
-    }
+      pump()
+    })
 
     // Build search vectors
     await db.execute(
@@ -159,7 +157,66 @@ export async function startOnrcImport(jobId: number): Promise<void> {
   }
 }
 
-// Status codes from od_stare_firma.csv: 1048 = active, 1084 = dissolved/inactive
+type MappedRow = NonNullable<ReturnType<typeof mapRow>>
+
+async function insertChunk(values: MappedRow[]) {
+  const clean = values.filter(Boolean) as MappedRow[]
+  if (!clean.length) return
+  await db.insert(companies).values(clean).onConflictDoUpdate({
+    target: companies.cui,
+    set: {
+      name: sql`EXCLUDED.name`,
+      status: sql`EXCLUDED.status`,
+      legalForm: sql`EXCLUDED.legal_form`,
+      county: sql`EXCLUDED.county`,
+      city: sql`EXCLUDED.city`,
+      address: sql`EXCLUDED.address`,
+      caenCode: sql`EXCLUDED.caen_code`,
+      caenDescription: sql`EXCLUDED.caen_description`,
+      registrationDate: sql`EXCLUDED.registration_date`,
+      jNumber: sql`EXCLUDED.j_number`,
+      lastOnrcSyncAt: sql`EXCLUDED.last_onrc_sync_at`,
+      updatedAt: sql`EXCLUDED.updated_at`,
+    },
+  })
+}
+
+function mapRow(r: Record<string, string>, stareMap: Map<string, string>) {
+  const name = (r.DENUMIRE ?? "").trim()
+  if (!name) return null
+
+  const cui = (r.CUI ?? "").replace(/^RO/, "").trim()
+  const jNumber = (r.COD_INMATRICULARE ?? "").trim() || null
+  if (!cui && !jNumber) return null
+
+  const statusCode = jNumber ? stareMap.get(jNumber) : undefined
+  const address = [
+    r.ADR_DEN_STRADA,
+    r.ADR_NR_STRADA,
+    r.ADR_BLOC ? `Bl. ${r.ADR_BLOC}` : "",
+    r.ADR_SCARA ? `Sc. ${r.ADR_SCARA}` : "",
+    r.ADR_APARTAMENT ? `Ap. ${r.ADR_APARTAMENT}` : "",
+    r.ADR_SECTOR ? `Sector ${r.ADR_SECTOR}` : "",
+  ].filter(Boolean).join(", ") || null
+
+  return {
+    cui: cui || `_${jNumber}`,
+    jNumber,
+    name,
+    status: mapStatusCode(statusCode),
+    legalForm: (r.FORMA_JURIDICA ?? "").trim() || null,
+    county: (r.ADR_JUDET ?? "").trim() || null,
+    city: (r.ADR_LOCALITATE ?? "").trim() || null,
+    address,
+    caenCode: null as null,
+    caenDescription: null as null,
+    registrationDate: parseDate(r.DATA_INMATRICULARE),
+    companyScore: 0,
+    lastOnrcSyncAt: new Date(),
+    updatedAt: new Date(),
+  }
+}
+
 function mapStatusCode(code: string | undefined): string {
   if (!code) return "activa"
   if (code === "1048") return "activa"
@@ -169,7 +226,6 @@ function mapStatusCode(code: string | undefined): string {
 
 function parseDate(raw: string | undefined): Date | null {
   if (!raw) return null
-  // Format: DD/MM/YYYY
   const parts = raw.trim().split("/")
   if (parts.length === 3) {
     const d = new Date(`${parts[2]}-${parts[1]}-${parts[0]}`)
