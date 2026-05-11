@@ -1,12 +1,12 @@
 import { parse } from "csv-parse"
 import { Readable } from "stream"
 import { db } from "@/lib/db"
-import { companies, syncJobs, syncChunks } from "@/lib/db/schema"
-import { sql, eq, and } from "drizzle-orm"
+import { companies, syncJobs } from "@/lib/db/schema"
+import { sql, eq } from "drizzle-orm"
 
 const CKAN_PACKAGE_ID = "firme-inregistrate-la-registrul-comertului"
 const CKAN_API = "https://data.gov.ro/api/3/action/package_show"
-const CHUNK_SIZE = 2000 // rows per chunk stored in DB
+const INSERT_CHUNK = 500 // rows per DB insert batch
 
 async function getLatestCsvUrl(): Promise<string> {
   const res = await fetch(`${CKAN_API}?id=${CKAN_PACKAGE_ID}`)
@@ -31,132 +31,96 @@ async function parseCsv(text: string): Promise<Record<string, string>[]> {
   })
 }
 
-// Step 1: download CSV once, split into chunks stored in DB, then kick off processing
 export async function startOnrcImport(jobId: number): Promise<void> {
   await db.update(syncJobs).set({ status: "running", startedAt: new Date() }).where(eq(syncJobs.id, jobId))
 
+  let rowsProcessed = 0
   try {
+    // Download CSV once
     const csvUrl = await getLatestCsvUrl()
-    await db.update(syncJobs).set({ csvUrl }).where(eq(syncJobs.id, jobId))
-
     const res = await fetch(csvUrl)
     if (!res.ok) throw new Error(`Failed to fetch CSV: ${res.status}`)
     const text = await res.text()
 
+    // Parse entire file in memory (fits easily in Vercel's 2GB limit)
     const records = await parseCsv(text)
-    const totalChunks = Math.ceil(records.length / CHUNK_SIZE)
 
-    // Store all chunks in DB
-    for (let i = 0; i < totalChunks; i++) {
-      const slice = records.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
-      await db.insert(syncChunks).values({
-        jobId,
-        chunkIndex: i,
-        data: JSON.stringify(slice),
-        processed: false,
-      })
+    // Upsert in chunks of 500 to stay within Neon's query size limits
+    for (let i = 0; i < records.length; i += INSERT_CHUNK) {
+      const chunk = records.slice(i, i + INSERT_CHUNK)
+      const values = chunk
+        .map((r) => ({
+          cui: (r.CUI || r.cui || "").replace(/^RO/, "").trim(),
+          jNumber: r.NR_REG_COM || r.j_number || null,
+          name: r.DENUMIRE || r.name || "",
+          status: mapStatus(r.STARE_FIRMA || r.status || ""),
+          legalForm: r.FORMA_JURIDICA || null,
+          county: r.JUDET || r.county || null,
+          city: r.LOCALITATE || r.city || null,
+          address: r.ADRESA || null,
+          caenCode: r.COD_CAEN || null,
+          caenDescription: r.DEN_CAEN || null,
+          registrationDate: parseDate(r.DATA_INREGISTRARE),
+          companyScore: 0,
+          lastOnrcSyncAt: new Date(),
+          updatedAt: new Date(),
+        }))
+        .filter((v) => v.cui)
+
+      if (!values.length) continue
+
+      await db
+        .insert(companies)
+        .values(values)
+        .onConflictDoUpdate({
+          target: companies.cui,
+          set: {
+            name: sql`EXCLUDED.name`,
+            status: sql`EXCLUDED.status`,
+            legalForm: sql`EXCLUDED.legal_form`,
+            county: sql`EXCLUDED.county`,
+            city: sql`EXCLUDED.city`,
+            address: sql`EXCLUDED.address`,
+            caenCode: sql`EXCLUDED.caen_code`,
+            caenDescription: sql`EXCLUDED.caen_description`,
+            registrationDate: sql`EXCLUDED.registration_date`,
+            jNumber: sql`EXCLUDED.j_number`,
+            lastOnrcSyncAt: sql`EXCLUDED.last_onrc_sync_at`,
+            updatedAt: sql`EXCLUDED.updated_at`,
+          },
+        })
+
+      rowsProcessed += values.length
+
+      // Update progress every 10 chunks so admin can watch it climb
+      if ((i / INSERT_CHUNK) % 10 === 0) {
+        await db.update(syncJobs).set({ rowsProcessed }).where(eq(syncJobs.id, jobId))
+      }
     }
 
-    await db.update(syncJobs).set({ currentOffset: 0, rowsProcessed: 0 }).where(eq(syncJobs.id, jobId))
-
-    // Kick off first chunk
-    await processNextChunk(jobId)
-  } catch (err) {
-    await db.update(syncJobs).set({ status: "failed", finishedAt: new Date(), errorMsg: String(err) }).where(eq(syncJobs.id, jobId))
-  }
-}
-
-// Step 2: process one chunk, mark it done, trigger next
-export async function processOnrcBatch(jobId: number): Promise<void> {
-  await processNextChunk(jobId)
-}
-
-async function processNextChunk(jobId: number): Promise<void> {
-  const [job] = await db.select().from(syncJobs).where(eq(syncJobs.id, jobId)).limit(1)
-  if (!job || job.status === "failed") return
-
-  // Find next unprocessed chunk
-  const [chunk] = await db
-    .select()
-    .from(syncChunks)
-    .where(and(eq(syncChunks.jobId, jobId), eq(syncChunks.processed, false)))
-    .orderBy(syncChunks.chunkIndex)
-    .limit(1)
-
-  if (!chunk) {
-    // All chunks done — update search vectors and mark complete
+    // Build search vectors for all newly synced companies
     await db.execute(
       sql`UPDATE companies
           SET search_vector = to_tsvector('simple',
             coalesce(name,'') || ' ' || coalesce(cui,'') || ' ' || coalesce(city,''))
           WHERE search_vector IS NULL`
     )
-    // Clean up chunks
-    await db.delete(syncChunks).where(eq(syncChunks.jobId, jobId))
-    await db.update(syncJobs).set({ status: "done", finishedAt: new Date() }).where(eq(syncJobs.id, jobId))
-    return
-  }
 
-  try {
-    const records: Record<string, string>[] = JSON.parse(chunk.data)
-
-    const values = records.map((r) => ({
-      cui: (r.CUI || r.cui || "").replace(/^RO/, "").trim(),
-      jNumber: r.NR_REG_COM || r.j_number || null,
-      name: r.DENUMIRE || r.name || "",
-      status: mapStatus(r.STARE_FIRMA || r.status || ""),
-      legalForm: r.FORMA_JURIDICA || null,
-      county: r.JUDET || r.county || null,
-      city: r.LOCALITATE || r.city || null,
-      address: r.ADRESA || null,
-      caenCode: r.COD_CAEN || null,
-      caenDescription: r.DEN_CAEN || null,
-      registrationDate: parseDate(r.DATA_INREGISTRARE),
-      companyScore: 0,
-      lastOnrcSyncAt: new Date(),
-      updatedAt: new Date(),
-    })).filter((v) => v.cui)
-
-    if (values.length) {
-      await db.insert(companies).values(values).onConflictDoUpdate({
-        target: companies.cui,
-        set: {
-          name: sql`EXCLUDED.name`,
-          status: sql`EXCLUDED.status`,
-          legalForm: sql`EXCLUDED.legal_form`,
-          county: sql`EXCLUDED.county`,
-          city: sql`EXCLUDED.city`,
-          address: sql`EXCLUDED.address`,
-          caenCode: sql`EXCLUDED.caen_code`,
-          caenDescription: sql`EXCLUDED.caen_description`,
-          registrationDate: sql`EXCLUDED.registration_date`,
-          jNumber: sql`EXCLUDED.j_number`,
-          lastOnrcSyncAt: sql`EXCLUDED.last_onrc_sync_at`,
-          updatedAt: sql`EXCLUDED.updated_at`,
-        },
-      })
-    }
-
-    // Mark chunk as processed
-    await db.update(syncChunks).set({ processed: true }).where(eq(syncChunks.id, chunk.id))
-    await db.update(syncJobs)
-      .set({ rowsProcessed: (job.rowsProcessed ?? 0) + values.length })
+    await db
+      .update(syncJobs)
+      .set({ status: "done", finishedAt: new Date(), rowsProcessed })
       .where(eq(syncJobs.id, jobId))
-
-    // Trigger next chunk via internal API
-    const baseUrl = process.env.NEXTAUTH_URL
-      ?? (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000")
-
-    fetch(`${baseUrl}/api/admin/onrc-batch`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-cron-secret": process.env.CRON_SECRET ?? "" },
-      body: JSON.stringify({ jobId }),
-    }).catch(console.error)
-
   } catch (err) {
-    await db.update(syncJobs).set({ status: "failed", finishedAt: new Date(), errorMsg: String(err) }).where(eq(syncJobs.id, jobId))
+    await db
+      .update(syncJobs)
+      .set({ status: "failed", finishedAt: new Date(), rowsProcessed, errorMsg: String(err) })
+      .where(eq(syncJobs.id, jobId))
+    throw err
   }
 }
+
+// Keep export name consistent with cron route
+export { startOnrcImport as runOnrcImport }
 
 function mapStatus(raw: string): string {
   const s = raw.toLowerCase()

@@ -131,15 +131,6 @@ export const verificationTokens = pgTable("verification_tokens", {
   expires: timestamp("expires").notNull(),
 })
 
-// Temporary storage for large CSV imports — rows stored as JSON chunks
-export const syncChunks = pgTable("sync_chunks", {
-  id: serial("id").primaryKey(),
-  jobId: integer("job_id").notNull(),
-  chunkIndex: integer("chunk_index").notNull(),
-  data: text("data").notNull(), // JSON array of rows
-  processed: boolean("processed").default(false),
-})
-
 export const syncJobs = pgTable("sync_jobs", {
   id: serial("id").primaryKey(),
   type: text("type").notNull(), // onrc_bulk | anaf_daily | financials_annual
@@ -148,9 +139,6 @@ export const syncJobs = pgTable("sync_jobs", {
   finishedAt: timestamp("finished_at"),
   rowsProcessed: integer("rows_processed").default(0),
   errorMsg: text("error_msg"),
-  // resumable batch tracking
-  csvUrl: text("csv_url"),
-  currentOffset: integer("current_offset").default(0),
   createdAt: timestamp("created_at").defaultNow(),
 })
 

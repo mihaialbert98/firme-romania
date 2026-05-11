@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
+
+export const maxDuration = 300
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { syncJobs } from "@/lib/db/schema"
@@ -20,12 +22,13 @@ export async function POST(req: NextRequest) {
 
   const [job] = await db.insert(syncJobs).values({ type, status: "pending" }).returning()
 
-  // Fire and forget — don't await so the response returns immediately
   const runners: Record<string, (id: number) => Promise<void>> = {
     onrc_bulk: startOnrcImport,
     anaf_daily: runAnafEnrichment,
     financials_annual: runFinancialsImport,
   }
+
+  // Fire and forget — response returns immediately, job runs async
   runners[type](job.id).catch(console.error)
 
   return NextResponse.json({ jobId: job.id })

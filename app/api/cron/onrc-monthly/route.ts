@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
+
+export const maxDuration = 300
 import { db } from "@/lib/db"
 import { syncJobs } from "@/lib/db/schema"
 import { startOnrcImport } from "@/lib/ingestion/onrc"
