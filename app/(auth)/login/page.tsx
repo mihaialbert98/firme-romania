@@ -21,7 +21,7 @@ export default function LoginPage() {
     if (res?.error) {
       setError("Email sau parolă incorectă.")
     } else {
-      router.push("/")
+      window.location.href = "/"
     }
   }
 
