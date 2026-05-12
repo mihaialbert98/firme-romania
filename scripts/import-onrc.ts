@@ -12,7 +12,7 @@ import { parse } from "csv-parse"
 import { neon } from "@neondatabase/serverless"
 import { drizzle } from "drizzle-orm/neon-http"
 import * as schema from "../lib/db/schema"
-import { companies, syncJobs } from "../lib/db/schema"
+import { companies, associates, syncJobs } from "../lib/db/schema"
 import { sql, eq } from "drizzle-orm"
 
 const db = drizzle(neon(process.env.DATABASE_URL!), { schema })
@@ -32,8 +32,9 @@ async function getLatestUrls() {
 
   const firme = resources.find((r) => r.url.endsWith("od_firme.csv"))?.url
   const stare = resources.find((r) => r.url.endsWith("od_stare_firma.csv"))?.url
+  const reps = resources.find((r) => r.url.endsWith("od_reprezentanti_legali.csv"))?.url
   if (!firme || !stare) throw new Error("CSV files not found in dataset")
-  return { firme, stare }
+  return { firme, stare, reps }
 }
 
 async function main() {
@@ -116,6 +117,62 @@ async function main() {
     await db.execute(
       sql`UPDATE companies SET search_vector = to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(cui,'') || ' ' || coalesce(city,'')) WHERE search_vector IS NULL`
     )
+
+    // Import legal representatives (associates/admins)
+    if (urls.reps) {
+      console.log("\nImporting legal representatives...")
+      await db.execute(sql`TRUNCATE associates`)
+
+      console.log("Building J-number → company id map...")
+      const jRows = await db.execute(sql`SELECT id, j_number FROM companies WHERE j_number IS NOT NULL`)
+      const jMap = new Map<string, number>()
+      for (const row of jRows.rows as { id: number; j_number: string }[]) {
+        jMap.set(row.j_number, row.id)
+      }
+      console.log(`J-number map: ${jMap.size} entries`)
+
+      const repsRes = await fetch(urls.reps)
+      if (!repsRes.ok || !repsRes.body) throw new Error(`Failed to fetch reps: ${repsRes.status}`)
+
+      type AssocRow = typeof associates.$inferInsert
+      let assocBuffer: AssocRow[] = []
+      let assocCount = 0
+
+      async function flushAssocs() {
+        if (!assocBuffer.length) return
+        const chunk = assocBuffer.splice(0)
+        await db.insert(associates).values(chunk)
+        assocCount += chunk.length
+        if (assocCount % 50000 < INSERT_CHUNK) {
+          process.stdout.write(`\r  ${assocCount.toLocaleString()} representatives inserted...`)
+        }
+      }
+
+      const repsParser = parse({ columns: true, skip_empty_lines: true, trim: true, bom: true, delimiter: "^", quote: false })
+      const repsReader = repsRes.body.getReader()
+      const repsPump = async () => {
+        while (true) {
+          const { done, value } = await repsReader.read()
+          if (done) { repsParser.end(); break }
+          repsParser.write(Buffer.from(value))
+        }
+      }
+      repsPump().catch(() => {})
+
+      for await (const record of repsParser as AsyncIterable<Record<string, string>>) {
+        const jNumber = (record.COD_INMATRICULARE ?? "").trim()
+        const name = (record.PERSOANA_IMPUTERNICITA ?? "").trim()
+        if (!jNumber || !name) continue
+        const companyId = jMap.get(jNumber)
+        if (!companyId) continue
+        const calitate = (record.CALITATE ?? "").toLowerCase().trim()
+        const role = calitate === "administrator" ? "admin" : "associate"
+        assocBuffer.push({ companyId, name, role, sharePercent: null })
+        if (assocBuffer.length >= INSERT_CHUNK) await flushAssocs()
+      }
+      await flushAssocs()
+      console.log(`\n  ${assocCount.toLocaleString()} representatives imported.`)
+    }
 
     await db.update(syncJobs).set({ status: "done", finishedAt: new Date(), rowsProcessed }).where(eq(syncJobs.id, job.id))
     console.log(`\nDone! ${rowsProcessed.toLocaleString()} companies imported.`)

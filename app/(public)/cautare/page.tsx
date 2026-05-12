@@ -1,6 +1,7 @@
 import { Navbar } from "@/components/navbar"
 import { SearchBar, StatusBadge } from "@/components/search-bar"
-import { searchCompanies } from "@/lib/search"
+import { searchCompanies, countCompanies } from "@/lib/search"
+import { Pagination } from "@/components/pagination"
 import Link from "next/link"
 import type { Metadata } from "next"
 
@@ -51,17 +52,19 @@ export default async function CautarePage({ searchParams }: { searchParams: Prom
   const hasFilters = statusFilter.length > 0 || countyFilter.length > 0 || empRange || turnRange
   const shouldSearch = q.trim().length >= 2 || hasFilters
 
-  const results = shouldSearch
-    ? await searchCompanies({
-        q: q.trim(),
-        status: statusFilter.length ? statusFilter : undefined,
-        county: countyFilter.length ? countyFilter : undefined,
-        employeesMin: empRange?.min,
-        employeesMax: empRange?.max,
-        turnoverMin: turnRange?.min,
-        turnoverMax: turnRange?.max,
-      }, limit, offset)
-    : []
+  const filters = {
+    q: q.trim(),
+    status: statusFilter.length ? statusFilter : undefined,
+    county: countyFilter.length ? countyFilter : undefined,
+    employeesMin: empRange?.min,
+    employeesMax: empRange?.max,
+    turnoverMin: turnRange?.min,
+    turnoverMax: turnRange?.max,
+  }
+
+  const [results, total] = shouldSearch
+    ? await Promise.all([searchCompanies(filters, limit, offset), countCompanies(filters)])
+    : [[], 0]
 
   function buildUrl(overrides: Record<string, string | undefined>) {
     const p = { q, status: params.status, county: params.county, employees: params.employees, turnover: params.turnover, ...overrides }
@@ -173,7 +176,7 @@ export default async function CautarePage({ searchParams }: { searchParams: Prom
               <p className="text-sm text-muted-foreground mb-4">
                 {results.length === 0
                   ? "Niciun rezultat"
-                  : `${results.length === limit ? `${limit}+` : results.length} rezultate`}
+                  : `${total.toLocaleString("ro-RO")} rezultate`}
                 {q && ` pentru „${q}"`}
               </p>
             )}
@@ -219,16 +222,7 @@ export default async function CautarePage({ searchParams }: { searchParams: Prom
               ))}
             </div>
 
-            {results.length === limit && (
-              <div className="mt-6 flex justify-center">
-                <Link
-                  href={buildUrl({ p: String(page + 1) })}
-                  className="px-4 py-2 rounded-lg border border-border hover:bg-secondary transition-colors text-sm"
-                >
-                  Pagina următoare →
-                </Link>
-              </div>
-            )}
+            <Pagination page={page} total={total} limit={limit} buildUrl={buildUrl} />
 
             {!shouldSearch && (
               <div className="text-center py-16 text-muted-foreground">

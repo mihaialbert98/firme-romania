@@ -32,7 +32,7 @@ async function getDatasetUrl(year: number): Promise<string> {
 }
 
 async function main() {
-  const year = parseInt(process.argv[2] ?? "") || new Date().getFullYear() - 1
+  const year = parseInt(process.argv[2] ?? "") || 2024
   console.log(`Importing financials for year: ${year}`)
 
   const [job] = await db.insert(syncJobs).values({ type: "financials_annual", status: "running", startedAt: new Date() }).returning()

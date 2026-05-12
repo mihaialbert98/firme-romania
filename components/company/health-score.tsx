@@ -1,20 +1,36 @@
 "use client"
-import { scoreLabel, scoreColor, scoreBg } from "@/lib/scoring"
+import { scoreLabel, scoreColor } from "@/lib/scoring"
 
 export function HealthScore({ score }: { score: number }) {
+  if (score === 0) {
+    return (
+      <div className="flex flex-col items-center" title="Scorul se calculează pe baza statusului fiscal, TVA și date financiare disponibile">
+        <div className="relative size-24">
+          <svg className="size-24 -rotate-90" viewBox="0 0 80 80">
+            <circle cx="40" cy="40" r="36" fill="none" stroke="hsl(var(--border))" strokeWidth="6" />
+          </svg>
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span className="text-lg text-muted-foreground">—</span>
+          </div>
+        </div>
+        <span className="text-sm font-medium mt-1 text-muted-foreground">Indisponibil</span>
+        <span className="text-xs text-muted-foreground">Scor sănătate</span>
+      </div>
+    )
+  }
+
   const circumference = 2 * Math.PI * 36
   const progress = (score / 100) * circumference
   const color = scoreColor(score)
-  const bgColor = scoreBg(score)
 
   return (
-    <div className="flex flex-col items-center">
+    <div className="flex flex-col items-center" title="Calculat pe baza: status activ, înregistrare TVA, date financiare disponibile">
       <div className="relative size-24">
         <svg className="size-24 -rotate-90" viewBox="0 0 80 80">
           <circle cx="40" cy="40" r="36" fill="none" stroke="hsl(var(--border))" strokeWidth="6" />
           <circle
             cx="40" cy="40" r="36" fill="none"
-            stroke={`currentColor`}
+            stroke="currentColor"
             strokeWidth="6"
             strokeDasharray={`${progress} ${circumference}`}
             strokeLinecap="round"

@@ -1,6 +1,6 @@
 import { db } from "@/lib/db"
 import { companies, financials } from "@/lib/db/schema"
-import { sql, eq, and, gte, lte, inArray } from "drizzle-orm"
+import { sql, eq, and, gte, lte, inArray, count } from "drizzle-orm"
 
 export type SearchFilters = {
   q?: string
@@ -16,28 +16,11 @@ export type SearchFilters = {
 }
 
 export async function searchCompanies(filters: SearchFilters, limit = 20, offset = 0) {
-  const { q, status, county, legalForm, caenCode, employeesMin, employeesMax, turnoverMin, turnoverMax, year } = filters
+  const { q, employeesMin, employeesMax, turnoverMin, turnoverMax, year } = filters
 
   const hasFinancialFilter = employeesMin != null || employeesMax != null || turnoverMin != null || turnoverMax != null
   const financialYear = year ?? new Date().getFullYear() - 1
-
-  const conditions = []
-
-  if (q?.trim()) {
-    const trimmed = q.trim()
-    if (/^\d+$/.test(trimmed)) {
-      conditions.push(eq(companies.cui, trimmed))
-    } else {
-      conditions.push(sql`${companies.searchVector} @@ plainto_tsquery('simple', ${trimmed})`)
-    }
-  }
-
-  if (status?.length) conditions.push(inArray(companies.status, status))
-  if (county?.length) conditions.push(inArray(companies.county, county))
-  if (legalForm?.length) conditions.push(inArray(companies.legalForm, legalForm))
-  if (caenCode) conditions.push(eq(companies.caenCode, caenCode))
-
-  const where = conditions.length ? and(...conditions) : undefined
+  const where = buildWhereConditions(filters)
 
   if (hasFinancialFilter) {
     const finConditions = [eq(financials.year, financialYear)]
@@ -97,4 +80,46 @@ export async function searchCompanies(filters: SearchFilters, limit = 20, offset
     )
     .limit(limit)
     .offset(offset)
+}
+
+function buildWhereConditions(filters: SearchFilters) {
+  const { q, status, county, legalForm, caenCode } = filters
+  const conditions = []
+  if (q?.trim()) {
+    const trimmed = q.trim()
+    if (/^\d+$/.test(trimmed)) {
+      conditions.push(eq(companies.cui, trimmed))
+    } else {
+      conditions.push(sql`${companies.searchVector} @@ plainto_tsquery('simple', ${trimmed})`)
+    }
+  }
+  if (status?.length) conditions.push(inArray(companies.status, status))
+  if (county?.length) conditions.push(inArray(companies.county, county))
+  if (legalForm?.length) conditions.push(inArray(companies.legalForm, legalForm))
+  if (caenCode) conditions.push(eq(companies.caenCode, caenCode))
+  return conditions.length ? and(...conditions) : undefined
+}
+
+export async function countCompanies(filters: SearchFilters): Promise<number> {
+  const { employeesMin, employeesMax, turnoverMin, turnoverMax, year } = filters
+  const hasFinancialFilter = employeesMin != null || employeesMax != null || turnoverMin != null || turnoverMax != null
+  const where = buildWhereConditions(filters)
+
+  if (hasFinancialFilter) {
+    const financialYear = year ?? new Date().getFullYear() - 1
+    const finConditions = [eq(financials.year, financialYear)]
+    if (employeesMin != null) finConditions.push(gte(financials.employees, employeesMin))
+    if (employeesMax != null) finConditions.push(lte(financials.employees, employeesMax))
+    if (turnoverMin != null) finConditions.push(gte(financials.turnover, turnoverMin * 1000))
+    if (turnoverMax != null) finConditions.push(lte(financials.turnover, turnoverMax * 1000))
+    const [row] = await db
+      .select({ total: count() })
+      .from(companies)
+      .innerJoin(financials, and(eq(financials.companyId, companies.id), ...finConditions))
+      .where(where)
+    return row?.total ?? 0
+  }
+
+  const [row] = await db.select({ total: count() }).from(companies).where(where)
+  return row?.total ?? 0
 }
