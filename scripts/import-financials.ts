@@ -43,14 +43,20 @@ async function main() {
     const url = await getDatasetUrl(year)
     console.log(`Dataset URL: ${url}`)
 
-    // Load CUI -> company id map
+    // Load CUI -> company id map (paged to avoid 64MB HTTP limit)
     console.log("Loading CUI map from DB...")
-    const allCompanies = await db.execute(sql`SELECT id, cui FROM companies`)
     const cuiMap = new Map<string, number>()
-    for (const row of allCompanies.rows as { id: number; cui: string }[]) {
-      cuiMap.set(row.cui, row.id)
+    const PAGE = 200000
+    let lastId = 0
+    while (true) {
+      const batch = await db.execute(sql`SELECT id, cui FROM companies WHERE id > ${lastId} ORDER BY id LIMIT ${PAGE}`)
+      const rows = batch.rows as { id: number; cui: string }[]
+      for (const row of rows) cuiMap.set(row.cui, row.id)
+      if (rows.length < PAGE) break
+      lastId = rows[rows.length - 1].id
+      process.stdout.write(`\r  ${cuiMap.size.toLocaleString()} entries loaded...`)
     }
-    console.log(`CUI map loaded: ${cuiMap.size} entries`)
+    console.log(`\nCUI map loaded: ${cuiMap.size} entries`)
 
     const res = await fetch(url)
     if (!res.ok || !res.body) throw new Error(`Failed to fetch: ${res.status}`)
