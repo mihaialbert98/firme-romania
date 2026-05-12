@@ -11,7 +11,7 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const results = await searchCompanies(q.trim(), limit, offset)
+    const results = await searchCompanies({ q: q.trim() }, limit, offset)
     return NextResponse.json(results)
   } catch {
     return NextResponse.json([], { status: 500 })

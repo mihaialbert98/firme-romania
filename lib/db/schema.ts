@@ -6,6 +6,7 @@ import {
   timestamp,
   serial,
   index,
+  unique,
   customType,
 } from "drizzle-orm/pg-core"
 
@@ -65,7 +66,9 @@ export const financials = pgTable("financials", {
   totalAssets: integer("total_assets"),
   employees: integer("employees"),
   createdAt: timestamp("created_at").defaultNow(),
-})
+}, (t) => [
+  unique("uq_financials_company_year").on(t.companyId, t.year),
+])
 
 export const associates = pgTable("associates", {
   id: serial("id").primaryKey(),

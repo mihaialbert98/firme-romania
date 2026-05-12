@@ -65,7 +65,10 @@ async function main() {
 
     async function flush() {
       if (!buffer.length) return
-      const chunk = buffer.splice(0)
+      const raw = buffer.splice(0)
+      const seen = new Map<string, Row>()
+      for (const row of raw) seen.set(row.cui, row)
+      const chunk = [...seen.values()]
       await db.insert(companies).values(chunk).onConflictDoUpdate({
         target: companies.cui,
         set: {
@@ -90,39 +93,24 @@ async function main() {
       }
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const parser = parse({ columns: true, skip_empty_lines: true, trim: true, bom: true, delimiter: "^", quote: false })
+    const parser = parse({ columns: true, skip_empty_lines: true, trim: true, bom: true, delimiter: "^", quote: false })
+    const reader = firmeRes.body!.getReader()
 
-      parser.on("readable", async () => {
-        let record: Record<string, string>
-        while ((record = parser.read()) !== null) {
-          const row = mapRow(record, stareMap)
-          if (row) buffer.push(row)
-          if (buffer.length >= INSERT_CHUNK) {
-            parser.pause()
-            await flush().catch(reject)
-            parser.resume()
-          }
-        }
-      })
-
-      parser.on("end", async () => {
-        await flush().catch(reject)
-        resolve()
-      })
-
-      parser.on("error", reject)
-
-      const reader = firmeRes.body!.getReader()
-      const pump = async () => {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) { parser.end(); break }
-          parser.write(Buffer.from(value))
-        }
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) { parser.end(); break }
+        parser.write(Buffer.from(value))
       }
-      pump().catch(reject)
-    })
+    }
+    pump().catch(() => {})
+
+    for await (const record of parser as AsyncIterable<Record<string, string>>) {
+      const row = mapRow(record, stareMap)
+      if (row) buffer.push(row)
+      if (buffer.length >= INSERT_CHUNK) await flush()
+    }
+    await flush()
 
     console.log(`\nBuilding search vectors...`)
     await db.execute(

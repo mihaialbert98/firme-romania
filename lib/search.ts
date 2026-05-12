@@ -1,13 +1,51 @@
 import { db } from "@/lib/db"
-import { companies } from "@/lib/db/schema"
-import { sql, eq, ilike, or } from "drizzle-orm"
+import { companies, financials } from "@/lib/db/schema"
+import { sql, eq, and, gte, lte, inArray } from "drizzle-orm"
 
-export async function searchCompanies(query: string, limit = 20, offset = 0) {
-  const q = query.trim()
-  if (!q) return []
+export type SearchFilters = {
+  q?: string
+  status?: string[]
+  county?: string[]
+  legalForm?: string[]
+  caenCode?: string
+  employeesMin?: number
+  employeesMax?: number
+  turnoverMin?: number    // RON thousands
+  turnoverMax?: number
+  year?: number
+}
 
-  // exact CUI match first
-  if (/^\d+$/.test(q)) {
+export async function searchCompanies(filters: SearchFilters, limit = 20, offset = 0) {
+  const { q, status, county, legalForm, caenCode, employeesMin, employeesMax, turnoverMin, turnoverMax, year } = filters
+
+  const hasFinancialFilter = employeesMin != null || employeesMax != null || turnoverMin != null || turnoverMax != null
+  const financialYear = year ?? new Date().getFullYear() - 1
+
+  const conditions = []
+
+  if (q?.trim()) {
+    const trimmed = q.trim()
+    if (/^\d+$/.test(trimmed)) {
+      conditions.push(eq(companies.cui, trimmed))
+    } else {
+      conditions.push(sql`${companies.searchVector} @@ plainto_tsquery('simple', ${trimmed})`)
+    }
+  }
+
+  if (status?.length) conditions.push(inArray(companies.status, status))
+  if (county?.length) conditions.push(inArray(companies.county, county))
+  if (legalForm?.length) conditions.push(inArray(companies.legalForm, legalForm))
+  if (caenCode) conditions.push(eq(companies.caenCode, caenCode))
+
+  const where = conditions.length ? and(...conditions) : undefined
+
+  if (hasFinancialFilter) {
+    const finConditions = [eq(financials.year, financialYear)]
+    if (employeesMin != null) finConditions.push(gte(financials.employees, employeesMin))
+    if (employeesMax != null) finConditions.push(lte(financials.employees, employeesMax))
+    if (turnoverMin != null) finConditions.push(gte(financials.turnover, turnoverMin * 1000))
+    if (turnoverMax != null) finConditions.push(lte(financials.turnover, turnoverMax * 1000))
+
     return db
       .select({
         id: companies.id,
@@ -20,10 +58,19 @@ export async function searchCompanies(query: string, limit = 20, offset = 0) {
         caenDescription: companies.caenDescription,
         companyScore: companies.companyScore,
         legalForm: companies.legalForm,
+        employees: financials.employees,
+        turnover: financials.turnover,
       })
       .from(companies)
-      .where(eq(companies.cui, q))
-      .limit(1)
+      .innerJoin(financials, and(eq(financials.companyId, companies.id), ...finConditions))
+      .where(where)
+      .orderBy(
+        q?.trim()
+          ? sql`ts_rank(${companies.searchVector}, plainto_tsquery('simple', ${q.trim()})) DESC`
+          : sql`${financials.employees} DESC NULLS LAST`
+      )
+      .limit(limit)
+      .offset(offset)
   }
 
   return db
@@ -38,12 +85,16 @@ export async function searchCompanies(query: string, limit = 20, offset = 0) {
       caenDescription: companies.caenDescription,
       companyScore: companies.companyScore,
       legalForm: companies.legalForm,
+      employees: sql<number | null>`null`.as("employees"),
+      turnover: sql<number | null>`null`.as("turnover"),
     })
     .from(companies)
-    .where(
-      sql`${companies.searchVector} @@ plainto_tsquery('simple', ${q})`
+    .where(where)
+    .orderBy(
+      q?.trim()
+        ? sql`ts_rank(${companies.searchVector}, plainto_tsquery('simple', ${q.trim()})) DESC`
+        : companies.name
     )
-    .orderBy(sql`ts_rank(${companies.searchVector}, plainto_tsquery('simple', ${q})) DESC`)
     .limit(limit)
     .offset(offset)
 }
