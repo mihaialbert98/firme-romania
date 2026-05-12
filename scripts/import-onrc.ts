@@ -91,7 +91,7 @@ async function main() {
     }
 
     await new Promise<void>((resolve, reject) => {
-      const parser = parse({ columns: true, skip_empty_lines: true, trim: true, bom: true, delimiter: "^" })
+      const parser = parse({ columns: true, skip_empty_lines: true, trim: true, bom: true, delimiter: "^", quote: false })
 
       parser.on("readable", async () => {
         let record: Record<string, string>
