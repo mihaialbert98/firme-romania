@@ -114,9 +114,17 @@ async function main() {
     await flush()
 
     console.log(`\nBuilding search vectors...`)
-    await db.execute(
-      sql`UPDATE companies SET search_vector = to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(cui,'') || ' ' || coalesce(city,'')) WHERE search_vector IS NULL`
-    )
+    let vectorsUpdated = 0
+    while (true) {
+      const result = await db.execute(
+        sql`UPDATE companies SET search_vector = to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(cui,'') || ' ' || coalesce(city,'')) WHERE id IN (SELECT id FROM companies WHERE search_vector IS NULL LIMIT 50000)`
+      )
+      const affected = result.rowCount ?? 0
+      vectorsUpdated += affected
+      process.stdout.write(`\r  ${vectorsUpdated.toLocaleString()} vectors built...`)
+      if (affected === 0) break
+    }
+    console.log()
 
     // Import legal representatives (associates/admins)
     if (urls.reps) {
@@ -124,12 +132,18 @@ async function main() {
       await db.execute(sql`TRUNCATE associates`)
 
       console.log("Building J-number → company id map...")
-      const jRows = await db.execute(sql`SELECT id, j_number FROM companies WHERE j_number IS NOT NULL`)
       const jMap = new Map<string, number>()
-      for (const row of jRows.rows as { id: number; j_number: string }[]) {
-        jMap.set(row.j_number, row.id)
+      const PAGE = 200000
+      let lastId = 0
+      while (true) {
+        const jRows = await db.execute(sql`SELECT id, j_number FROM companies WHERE j_number IS NOT NULL AND id > ${lastId} ORDER BY id LIMIT ${PAGE}`)
+        const rows = jRows.rows as { id: number; j_number: string }[]
+        for (const row of rows) jMap.set(row.j_number, row.id)
+        if (rows.length < PAGE) break
+        lastId = rows[rows.length - 1].id
+        process.stdout.write(`\r  ${jMap.size.toLocaleString()} entries loaded...`)
       }
-      console.log(`J-number map: ${jMap.size} entries`)
+      console.log(`\nJ-number map: ${jMap.size} entries`)
 
       const repsRes = await fetch(urls.reps)
       if (!repsRes.ok || !repsRes.body) throw new Error(`Failed to fetch reps: ${repsRes.status}`)

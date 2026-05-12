@@ -26,7 +26,7 @@ async function getDatasetUrl(year: number): Promise<string> {
   if (!json.success) throw new Error(`Dataset not found: ${id}`)
   const resources: { url: string; name: string }[] = json.result.resources
   const target = `WEB_BL_BS_SL_AN${year}`
-  const txt = resources.find((r) => r.name === target && r.url.endsWith(".txt"))?.url
+  const txt = resources.find((r) => r.name.toUpperCase().startsWith(target) && r.url.endsWith(".txt"))?.url
   if (!txt) throw new Error(`Could not find ${target}.txt in dataset ${id}`)
   return txt
 }
